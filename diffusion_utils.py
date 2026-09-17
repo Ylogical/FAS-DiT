@@ -134,11 +134,13 @@ class DiffusionSchedule:
 
 
 def dice_loss(pred, target, smooth=1e-5):
-    """Soft Dice loss.
+    """Soft Dice loss, averaged over channels and then over the batch.
 
     Args:
         pred:   predicted mask (B, C, H, W) in [0, 1]
-        target: binary GT mask (B, C, H, W) in {0, 1}
+        target: binary GT mask (B, C, H, W) in {0, 1}; for multi-class masks the
+                C channels are the signed one-hot classes, so this is the usual
+                per-class Dice (background included)
     Returns:
         scalar loss
     """
@@ -148,32 +150,52 @@ def dice_loss(pred, target, smooth=1e-5):
     return (1.0 - dice.mean(dim=1)).mean()
 
 
-def compute_loss(model, diffusion, batch, device, use_dice=True, dice_weight=1.0):
-    """Training objective: MSE on the clean mask + soft Dice.
+def compute_loss(model, diffusion, batch, device, use_dice=True, dice_weight=1.0,
+                 ce_weight=0.0):
+    """Training objective: MSE on the clean mask + soft Dice (+ CE for multi-class).
 
-        L = || x0_hat - x0 ||^2 + lambda_dice * Dice(x0_hat, x0)
+        L = || x0_hat - x0 ||^2
+            + lambda_Dice * Dice(x0_hat, x0)
+            + lambda_CE   * CE(x0_hat, label)
 
     Because the same target x0 is regressed at every timestep, the whole
     denoising trajectory receives consistent shape supervision.
+
+    ce_weight > 0 is only valid for multi-class masks, where the network uses
+    the softmax x0 head: there (x0_hat + 1) / 2 is normalized across channels
+    and is therefore a per-pixel class distribution. The CE term carries
+    gradient that does not pass through a saturating tanh, which is what keeps
+    the small organs from collapsing to the background class.
 
     Returns:
         (loss, model_output, target)
     """
     image = batch['image'].to(device)
-    mask  = batch['mask'].to(device)        # (B, 1, H, W) in {-1, +1}
+    mask  = batch['mask'].to(device)        # (B, K, H, W) in {-1, +1}, K = 1 if binary
 
     # Sample a timestep per image and add noise
     t = torch.randint(0, diffusion.num_timesteps, (mask.shape[0],), device=device).long()
     x_t, _ = diffusion.q_sample(mask, t)
 
-    pred_x0 = model(x_t, t, image)          # tanh output in [-1, 1]
+    pred_x0 = model(x_t, t, image)          # tanh / softmax output in [-1, 1]
 
     loss = F.mse_loss(pred_x0, mask)
 
-    if use_dice:
+    if use_dice or ce_weight > 0.0:
         # Linear map to [0, 1] instead of a sigmoid, which would squash +-1 into
-        # [0.27, 0.73] and weaken the binary supervision.
-        loss = loss + dice_weight * dice_loss((pred_x0 + 1.0) / 2.0,
-                                              (mask > 0.0).float())
+        # [0.27, 0.73] and weaken the supervision.
+        pred_01 = (pred_x0 + 1.0) / 2.0
+
+        if use_dice:
+            loss = loss + dice_weight * dice_loss(pred_01, (mask > 0.0).float())
+
+        if ce_weight > 0.0:
+            if mask.shape[1] == 1:
+                raise ValueError('ce_weight > 0 needs a multi-class mask '
+                                 '(mask_channels > 1) and the softmax x0 head')
+            label = batch.get('label_idx')
+            label = (mask.argmax(dim=1) if label is None else label.to(device)).long()
+            loss = loss + ce_weight * F.nll_loss(torch.log(pred_01.clamp_min(1e-7)),
+                                                 label)
 
     return loss, pred_x0, mask

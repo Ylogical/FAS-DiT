@@ -7,6 +7,12 @@ early stopping, weight decay and dropout for regularization.
 Per-dataset defaults (image size, model variant, epochs, lr, batch size, early
 stopping, ...) are selected automatically from --dataset; see _DATASET_DEFAULTS
 below. Run `python train.py --help` for the full list of flags.
+
+Synapse is the one multi-class dataset (background + 8 organs): the mask carries
+9 signed one-hot channels, the network switches to the softmax x0 head, and a
+weighted cross-entropy term (lambda_CE = 0.5) is added to the objective. Its
+split (18 training cases, 12 test cases) defines no validation set, so training
+there runs the full schedule and final_model.pth is the model to evaluate.
 """
 import os
 import json
@@ -20,7 +26,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from model_fas_dit import FASDiT_models
-from dataset import get_dataloader_with_val
+from dataset import get_dataloader_with_val, get_num_classes
 from diffusion_utils import DiffusionSchedule, compute_loss
 from training_logger import TrainingLogger
 
@@ -48,7 +54,20 @@ _DATASET_DEFAULTS = {
                 'lr': 1e-4, 'epochs': 20000, 'warmup_epochs': 60,
                 'patience': 20, 'metrics_eval_freq': 25, 'es_min_epochs': 10000,
                 'weight_decay': 0.05, 'attn_drop': 0.1, 'proj_drop': 0.1},
+    # Multi-class abdominal CT: ~2200 training slices, so fewer epochs and
+    # lighter regularization than the small binary sets. The standard split has
+    # no validation set, hence the full schedule and no early stopping.
+    'synapse': {'image_size': 224, 'model': 'FASDiT-B/16', 'batch_size': 8,
+                'lr': 2e-4, 'epochs': 10000, 'warmup_epochs': 30,
+                'patience': 15, 'metrics_eval_freq': 20, 'es_min_epochs': 10000,
+                'weight_decay': 0.02, 'attn_drop': 0.05, 'proj_drop': 0.05,
+                'ce_weight': 0.5},
 }
+
+# lambda_CE is 0 on the binary datasets: the cross-entropy term needs the
+# multi-class softmax x0 head to be a distribution over channels.
+for _cfg in _DATASET_DEFAULTS.values():
+    _cfg.setdefault('ce_weight', 0.0)
 
 
 class EMA:
@@ -122,15 +141,17 @@ def parse_args():
 Examples:
   python train.py --dataset glas
   python train.py --dataset monuseg --gpu 0
+  python train.py --dataset synapse                 # multi-class, 9 organs
   python train.py --dataset glas --resume checkpoints/<run>/checkpoint_epoch100.pth
 ''')
     # Data
     parser.add_argument('--dataset', type=str, default='glas',
-                        choices=['glas', 'monuseg', 'ph2', 'imid'])
+                        choices=['glas', 'monuseg', 'ph2', 'imid', 'synapse'])
     parser.add_argument('--image_size', type=int, default=None,
-                        help='Input size (default: glas/ph2/imid=256, monuseg=512)')
+                        help='Input size (default: glas/ph2/imid=256, '
+                             'monuseg=512, synapse=224)')
     parser.add_argument('--batch_size', type=int, default=None,
-                        help='Batch size (default: glas/ph2=8, monuseg/imid=4)')
+                        help='Batch size (default: glas/ph2/synapse=8, monuseg/imid=4)')
     parser.add_argument('--num_workers', type=int, default=4)
 
     # Model
@@ -138,6 +159,8 @@ Examples:
                         choices=list(FASDiT_models.keys()),
                         help='Model variant (default: B/16, monuseg=B/32)')
     parser.add_argument('--image_channels', type=int, default=3)
+    parser.add_argument('--mask_channels', type=int, default=None,
+                        help='Mask channels (default: 1, synapse=9)')
 
     # Diffusion
     parser.add_argument('--num_timesteps', type=int, default=200,
@@ -148,7 +171,8 @@ Examples:
     # Optimization
     parser.add_argument('--epochs', type=int, default=None)
     parser.add_argument('--lr', type=float, default=None,
-                        help='Learning rate (default: glas/ph2/imid=2e-4, monuseg=1e-4)')
+                        help='Learning rate (default: glas/ph2/imid/synapse=2e-4, '
+                             'monuseg=1e-4)')
     parser.add_argument('--weight_decay', type=float, default=None, help='Default: 0.05')
     parser.add_argument('--grad_clip', type=float, default=1.0)
     parser.add_argument('--warmup_epochs', type=int, default=None)
@@ -159,6 +183,9 @@ Examples:
                         help='Train with the MSE term only')
     parser.add_argument('--dice_weight', type=float, default=1.0,
                         help='Weight of the Dice term (lambda_Dice)')
+    parser.add_argument('--ce_weight', type=float, default=None,
+                        help='Weight of the multi-class cross-entropy term '
+                             '(lambda_CE; default: synapse=0.5, binary=0)')
     parser.add_argument('--attn_drop', type=float, default=None, help='Default: 0.1')
     parser.add_argument('--proj_drop', type=float, default=None, help='Default: 0.1')
 
@@ -217,6 +244,7 @@ def train_one_epoch(model, diffusion, train_loader, optimizer, device, epoch,
             model, diffusion, batch, device,
             use_dice=not args.no_dice_loss,
             dice_weight=args.dice_weight,
+            ce_weight=args.ce_weight,
         )
         optimizer.zero_grad()
         loss.backward()
@@ -250,6 +278,7 @@ def evaluate(model, diffusion, val_loader, device, epoch, writer, args):
             model, diffusion, batch, device,
             use_dice=not args.no_dice_loss,
             dice_weight=args.dice_weight,
+            ce_weight=args.ce_weight,
         )
         total_loss += loss.item()
     avg_loss = total_loss / len(val_loader)
@@ -257,11 +286,56 @@ def evaluate(model, diffusion, val_loader, device, epoch, writer, args):
     return avg_loss
 
 
+def _binary_slice_metrics(pred_bin, gt_bin, out):
+    """Per-image IoU / DSC / Sen / Acc for binary masks, appended to out."""
+    for i in range(pred_bin.shape[0]):
+        p = pred_bin[i].reshape(-1)
+        g = gt_bin[i].reshape(-1)
+        tp = (p * g).sum().item()
+        fp = (p * (1 - g)).sum().item()
+        fn = ((1 - p) * g).sum().item()
+        tn = ((1 - p) * (1 - g)).sum().item()
+        out[0].append(tp / (tp + fp + fn + 1e-6))
+        out[1].append(2 * tp / (2 * tp + fp + fn + 1e-6))
+        out[2].append(tp / (tp + fn + 1e-6))
+        out[3].append((tp + tn) / (tp + fp + fn + tn + 1e-6))
+
+
+def _multiclass_slice_metrics(pred_idx, gt_idx, num_classes, out):
+    """Per-image macro IoU / DSC / Sen / Acc over the foreground classes.
+
+    Classes absent from both the prediction and the GT of a slice are skipped,
+    so empty organs do not inflate the average.
+    """
+    for i in range(pred_idx.shape[0]):
+        p, g = pred_idx[i], gt_idx[i]
+        cls_iou, cls_dice, cls_sen = [], [], []
+        for c in range(1, num_classes):
+            pc, gc = (p == c), (g == c)
+            inter, p_sum, g_sum = (pc & gc).sum().item(), pc.sum().item(), gc.sum().item()
+            if p_sum == 0 and g_sum == 0:
+                continue
+            cls_iou.append(inter / (p_sum + g_sum - inter + 1e-6))
+            cls_dice.append(2 * inter / (p_sum + g_sum + 1e-6))
+            cls_sen.append(inter / (g_sum + 1e-6))
+        if cls_dice:
+            out[0].append(float(np.mean(cls_iou)))
+            out[1].append(float(np.mean(cls_dice)))
+            out[2].append(float(np.mean(cls_sen)))
+            out[3].append((p == g).float().mean().item())
+
+
 @torch.no_grad()
 def evaluate_metrics(model, diffusion, val_loader, device, epoch, writer, args):
-    """Validation mIoU / DSC / Sensitivity / Accuracy via 20-step DDIM sampling."""
+    """Validation mIoU / DSC / Sensitivity / Accuracy via 20-step DDIM sampling.
+
+    Multi-class masks are scored by argmax over the channels and macro-averaged
+    over the foreground classes; this is the at-224 slice-level score used for
+    model selection, not the case-wise 3D score that inference.py reports.
+    """
     model.eval()
     iou_list, dice_list, sen_list, acc_list = [], [], [], []
+    acc = (iou_list, dice_list, sen_list, acc_list)
 
     for batch in tqdm(val_loader, desc=f'Metrics Eval (Epoch {epoch + 1})', leave=False):
         images   = batch['image'].to(device)
@@ -271,19 +345,12 @@ def evaluate_metrics(model, diffusion, val_loader, device, epoch, writer, args):
         pred_masks = diffusion.ddim_sample(model, (B, C, H, W), images, device,
                                            ddim_steps=20, eta=0.0, progress=False)
 
-        pred_bin = (pred_masks > 0.0).float()
-        gt_bin   = (gt_masks   > 0.0).float()
-        for i in range(B):
-            p = pred_bin[i].reshape(-1)
-            g = gt_bin[i].reshape(-1)
-            tp = (p * g).sum().item()
-            fp = (p * (1 - g)).sum().item()
-            fn = ((1 - p) * g).sum().item()
-            tn = ((1 - p) * (1 - g)).sum().item()
-            iou_list.append(tp / (tp + fp + fn + 1e-6))
-            dice_list.append(2 * tp / (2 * tp + fp + fn + 1e-6))
-            sen_list.append(tp / (tp + fn + 1e-6))
-            acc_list.append((tp + tn) / (tp + fp + fn + tn + 1e-6))
+        if C > 1:
+            _multiclass_slice_metrics(pred_masks.argmax(dim=1),
+                                      gt_masks.argmax(dim=1), C, acc)
+        else:
+            _binary_slice_metrics((pred_masks > 0.0).float(),
+                                  (gt_masks > 0.0).float(), acc)
 
     mean_iou  = float(np.mean(iou_list))
     mean_dice = float(np.mean(dice_list))
@@ -310,7 +377,9 @@ def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path,
     if args is not None:
         checkpoint['train_config'] = {
             'model': args.model,
+            'dataset': args.dataset,
             'image_size': args.image_size,
+            'mask_channels': args.mask_channels,
             'num_timesteps': args.num_timesteps,
             'beta_schedule': args.beta_schedule,
             'attn_drop': args.attn_drop,
@@ -342,11 +411,18 @@ def main():
     cfg = _DATASET_DEFAULTS[args.dataset.lower()]
     for key in ('image_size', 'batch_size', 'model', 'epochs', 'lr', 'weight_decay',
                 'warmup_epochs', 'attn_drop', 'proj_drop', 'metrics_eval_freq',
-                'patience', 'es_min_epochs'):
+                'patience', 'es_min_epochs', 'ce_weight'):
         if getattr(args, key) is None:
             setattr(args, key, cfg[key])
     if args.eval_freq is None:
         args.eval_freq = args.metrics_eval_freq
+
+    # Multi-class datasets (synapse) carry one signed one-hot channel per class
+    if args.mask_channels is None:
+        args.mask_channels = get_num_classes(args.dataset)
+    if args.mask_channels == 1 and args.ce_weight > 0:
+        raise ValueError('--ce_weight > 0 needs a multi-class dataset: on a '
+                         'binary mask the softmax x0 head is not defined')
 
     set_seed(args.seed)
 
@@ -362,6 +438,9 @@ def main():
     print("=" * 60)
     print(f"Experiment: {exp_name}")
     print(f"Dataset: {args.dataset} | Image: {args.image_size} | Batch: {args.batch_size}")
+    if args.mask_channels > 1:
+        print(f"Multi-class: {args.mask_channels} mask channels, softmax x0 head, "
+              f"lambda_CE={args.ce_weight}")
     print(f"Model: {args.model} | Epochs: {args.epochs} | LR: {args.lr}")
     print(f"WeightDecay: {args.weight_decay} | Dropout(attn/proj): "
           f"{args.attn_drop}/{args.proj_drop}")
@@ -389,14 +468,21 @@ def main():
         image_size=args.image_size,
         num_workers=args.num_workers,
     )
-    print(f"Train: {len(train_loader.dataset)}  Val: {len(val_loader.dataset)}  "
+    has_val = val_loader is not None
+    print(f"Train: {len(train_loader.dataset)}  "
+          f"Val: {len(val_loader.dataset) if has_val else 0}  "
           f"Test: {len(test_loader.dataset)}")
+    if not has_val:
+        print("No validation split: early stopping and best-model selection are "
+              "off, training runs the full schedule and final_model.pth is the "
+              "model to evaluate. Run prepare_synapse_split.py --val_cases N to "
+              "hold cases out instead.")
 
     # Model
     print("Creating model...")
     model = FASDiT_models[args.model](
         input_size=args.image_size,
-        mask_channels=1,
+        mask_channels=args.mask_channels,
         image_channels=args.image_channels,
         attn_drop=args.attn_drop,
         proj_drop=args.proj_drop,
@@ -419,13 +505,15 @@ def main():
     if args.resume:
         start_epoch = load_checkpoint(model, optimizer, scheduler, args.resume, ema) + 1
 
-    early_stopper = EarlyStopping(patience=args.patience, min_delta=args.es_delta,
-                                  min_epochs=args.es_min_epochs) if args.patience > 0 else None
+    early_stopper = (EarlyStopping(patience=args.patience, min_delta=args.es_delta,
+                                   min_epochs=args.es_min_epochs)
+                     if args.patience > 0 and has_val else None)
 
     logger = TrainingLogger(log_dir=log_dir, exp_name=exp_name)
     logger.log(f"Training config:\n{json.dumps(vars(args), indent=2, default=str)}")
     logger.log(f"Dataset: {args.dataset}  Train={len(train_loader.dataset)}  "
-               f"Val={len(val_loader.dataset)}  Test={len(test_loader.dataset)}")
+               f"Val={len(val_loader.dataset) if has_val else 0}  "
+               f"Test={len(test_loader.dataset)}")
     logger.log(f"Model params: {total_p:,} ({total_p / 1e6:.2f}M)")
 
     # ---- Training loop ----
@@ -446,7 +534,7 @@ def main():
 
         # ---- Validation loss ----
         eval_loss = None
-        if (epoch + 1) % args.eval_freq == 0:
+        if has_val and (epoch + 1) % args.eval_freq == 0:
             if ema is not None:
                 ema.apply_shadow()
             try:
@@ -467,7 +555,7 @@ def main():
 
         # ---- IoU / DSC metrics ----
         iou = dice = sen = acc = None
-        if (epoch + 1) % args.metrics_eval_freq == 0:
+        if has_val and (epoch + 1) % args.metrics_eval_freq == 0:
             if ema is not None:
                 ema.apply_shadow()
             try:
@@ -519,7 +607,9 @@ def main():
 
     logger.close()
     writer.close()
-    print("Training completed! Use best_model.pth (best validation mIoU) for testing.")
+    print("Training completed! Evaluate "
+          + ("best_model.pth (best validation mIoU)." if has_val
+             else "final_model.pth (this split has no validation set)."))
 
 
 if __name__ == '__main__':

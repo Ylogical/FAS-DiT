@@ -13,6 +13,7 @@ dependencies:
   - scipy
   - matplotlib
   - pillow
+  - h5py
   - pip:
     - tqdm==4.66.4
     - einops==0.8.1

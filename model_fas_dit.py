@@ -497,7 +497,7 @@ class FASDiT_Segmentation(nn.Module):
         self,
         input_size=256,          # input image size
         patch_size=16,           # patch size
-        mask_channels=1,         # mask channels (binary segmentation = 1)
+        mask_channels=1,         # mask channels (binary = 1, multi-class = K incl. background)
         image_channels=3,        # image channels (RGB = 3)
         hidden_size=1024,
         depth=24,
@@ -506,9 +506,16 @@ class FASDiT_Segmentation(nn.Module):
         attn_drop=0.1,           # attention dropout in the middle blocks
         proj_drop=0.1,           # projection dropout in the middle blocks
         dfca_attn_drop=0.1,      # attention dropout inside DFCA
+        x0_softmax=None,         # multi-class x0 head (default: on iff mask_channels > 1)
     ):
         super().__init__()
         self.mask_channels = mask_channels
+        if x0_softmax is None:
+            x0_softmax = (mask_channels > 1)
+        if x0_softmax and mask_channels == 1:
+            raise ValueError('x0_softmax needs mask_channels > 1; a single-channel '
+                             'softmax is constant 1, so binary masks use the tanh head')
+        self.x0_softmax = x0_softmax
         self.image_channels = image_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
@@ -661,8 +668,22 @@ class FASDiT_Segmentation(nn.Module):
             mask_tokens = mask_tokens + dfca(mask_tokens, image_tokens, c, t_emb)
 
         # === 5. Output head ===
-        # tanh maps the clean-mask estimate into the [-1, 1] mask range
-        return torch.tanh(self.final_layer(mask_tokens, c, mask_skips, image_skips, t_emb))
+        return self._x0_act(
+            self.final_layer(mask_tokens, c, mask_skips, image_skips, t_emb))
+
+    def _x0_act(self, z):
+        """Map the decoder output into the [-1, 1] mask range.
+
+        Binary (K = 1): tanh, one independent channel.
+        Multi-class (K > 1): x0 = 2 * softmax(z) - 1. The range is the same, but
+        a signed one-hot target satisfies sum_c x0[c] = 2 - K at every pixel,
+        which the softmax head matches by construction; raising one channel
+        lowers the others, so a rare organ is not dragged to -1 by its own
+        negatives and stuck in the saturated region of a per-channel tanh.
+        """
+        if self.x0_softmax:
+            return 2.0 * z.softmax(dim=1) - 1.0
+        return torch.tanh(z)
 
 
 # ============================================

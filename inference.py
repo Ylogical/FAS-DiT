@@ -1,14 +1,25 @@
 """
 FASDiT inference and evaluation.
 
-Every test image is sampled K times with deterministic DDIM; the K soft
-predictions are averaged into an MMSE estimate and then thresholded. Reports
-mIoU, DSC, Sensitivity (Recall), Accuracy, Precision, HD95, GED and ECE, plus
-the parameter count and GFLOPs.
+Every test image is sampled K times with deterministic DDIM and the K soft
+predictions are averaged into an MMSE estimate.
 
-Example:
+Binary datasets: the estimate is thresholded per image, and the report gives
+mIoU, DSC, Sensitivity (Recall), Accuracy, Precision, HD95, GED and ECE.
+
+Synapse (multi-class): the estimate is taken per class by argmax, restored to
+the native 512x512 label resolution with nearest-neighbour upsampling, and the
+slices of a case are stacked back into a 3D volume. The report gives the
+case-wise 3D DSC and HD95 per organ, each averaged over cases first and then
+over the eight organs, next to the slice-level scores.
+
+Both paths also report the parameter count and GFLOPs.
+
+Examples:
   python inference.py --checkpoint checkpoints/<run>/best_model.pth \\
       --dataset glas --use_ema --K 25 --save_images
+  python inference.py --checkpoint checkpoints/<run>/final_model.pth \\
+      --dataset synapse --use_ema --K 25
 """
 import os
 import time
@@ -20,7 +31,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from model_fas_dit import FASDiT_models
-from dataset import get_dataloader
+from dataset import get_dataloader, get_num_classes, SynapseDataset
 from diffusion_utils import DiffusionSchedule
 
 try:
@@ -271,6 +282,167 @@ def run_inference(model, diffusion, test_loader, device, args):
     }
 
 
+
+# ----------------------------------------------
+# Multi-class evaluation (Synapse)
+# ----------------------------------------------
+# Palette for the 9 Synapse classes (index 0 = background)
+_PALETTE = np.array([
+    [0, 0, 0], [220, 20, 60], [0, 200, 0], [30, 144, 255], [255, 215, 0],
+    [148, 0, 211], [255, 140, 0], [0, 255, 255], [255, 105, 180],
+], dtype=np.uint8)
+
+
+def _slice_index(filename, fallback):
+    """Slice number out of a "caseXXXX_sliceYYY" sample name."""
+    if '_slice' in filename:
+        try:
+            return int(filename.split('_slice')[-1])
+        except ValueError:
+            pass
+    return fallback
+
+
+@torch.no_grad()
+def run_inference_multiclass(model, diffusion, test_loader, device, args):
+    """Case-wise 3D evaluation of the Synapse multi-organ predictions.
+
+    Per slice: average K DDIM samples, argmax over the class channels, then
+    restore the prediction to the native label resolution (512x512) with
+    nearest-neighbour upsampling, which is the protocol the compared methods
+    use. Slices are cached per case, stacked into a volume in slice order, and
+    scored per organ; each organ is averaged over cases first and the eight
+    organ scores are then averaged (the TransUNet aggregation order).
+
+    A (case, organ) pair with an empty prediction and an empty GT scores DSC 1;
+    HD95 is undefined whenever either side is empty and counts as 0 there, and
+    the number of such pairs is reported alongside.
+    """
+    from collections import defaultdict
+
+    model.eval()
+    num_classes = args.mask_channels
+    organ_names = SynapseDataset.ORGAN_NAMES
+
+    # Slice-level (native resolution) macro scores, for reference
+    slice_iou, slice_dice, slice_sen, slice_acc = [], [], [], []
+    # case id -> [(slice index, prediction (H, W), GT (H, W))]
+    case_slices = defaultdict(list)
+
+    if args.save_images:
+        img_dir = os.path.join(args.output_dir, args.dataset, 'images')
+        os.makedirs(img_dir, exist_ok=True)
+
+    sample_idx = 0
+    t_start = time.perf_counter()
+
+    for batch in tqdm(test_loader, desc='Running inference (multi-class)'):
+        images    = batch['image'].to(device)          # (B, 3, H, W)
+        gt_masks  = batch['mask'].to(device)           # (B, K, H, W) in {-1, +1}
+        case_ids  = batch.get('case_id',  [''] * images.shape[0])
+        filenames = batch.get('filename', [''] * images.shape[0])
+        B, _, H, W = images.shape
+
+        # K independent DDIM trajectories, averaged into the MMSE estimate
+        pred_avg = None
+        for _ in range(args.K):
+            pred_k = diffusion.ddim_sample(model, (B, num_classes, H, W), images,
+                                           device, ddim_steps=args.ddim_steps,
+                                           eta=args.eta, progress=False).float()
+            pred_avg = pred_k if pred_avg is None else pred_avg + pred_k
+        pred_avg = pred_avg / args.K
+
+        # Restore to the native label resolution when the loader provides it
+        label_full = batch.get('label_full')
+        if label_full is not None:
+            H0, W0 = label_full.shape[-2], label_full.shape[-1]
+            pred_idx = torch.nn.functional.interpolate(
+                pred_avg.argmax(dim=1, keepdim=True).float(), size=(H0, W0),
+                mode='nearest').squeeze(1).long().cpu().numpy()
+            gt_idx = label_full.numpy().astype(np.int64)
+        else:
+            pred_idx = pred_avg.argmax(dim=1).cpu().numpy()
+            gt_idx   = gt_masks.argmax(dim=1).cpu().numpy()
+
+        for i in range(B):
+            p, g = pred_idx[i], gt_idx[i]
+
+            cls_iou, cls_dice, cls_sen = [], [], []
+            for c in range(1, num_classes):
+                pc, gc = (p == c), (g == c)
+                inter, p_sum, g_sum = float((pc & gc).sum()), float(pc.sum()), float(gc.sum())
+                if p_sum == 0 and g_sum == 0:
+                    continue        # organ absent from this slice
+                cls_iou.append(inter / (p_sum + g_sum - inter + 1e-6))
+                cls_dice.append(2 * inter / (p_sum + g_sum + 1e-6))
+                cls_sen.append(inter / (g_sum + 1e-6))
+            if cls_dice:
+                slice_iou.append(float(np.mean(cls_iou)))
+                slice_dice.append(float(np.mean(cls_dice)))
+                slice_sen.append(float(np.mean(cls_sen)))
+                slice_acc.append(float((p == g).sum()) / p.size)
+
+            case_slices[case_ids[i]].append(
+                (_slice_index(filenames[i], sample_idx),
+                 p.astype(np.uint8), g.astype(np.uint8)))
+
+            if args.save_images:
+                img_vis = ((images[i].cpu().numpy().transpose(1, 2, 0) + 1.0) / 2.0
+                           * 255).clip(0, 255).astype(np.uint8)
+                Image.fromarray(img_vis).save(
+                    os.path.join(img_dir, f'{sample_idx:04d}_image.png'))
+                Image.fromarray(_PALETTE[g.clip(0, num_classes - 1)]).save(
+                    os.path.join(img_dir, f'{sample_idx:04d}_gt.png'))
+                Image.fromarray(_PALETTE[p.clip(0, num_classes - 1)]).save(
+                    os.path.join(img_dir, f'{sample_idx:04d}_pred.png'))
+
+            sample_idx += 1
+
+    total_time = time.perf_counter() - t_start
+
+    # ---- Case-wise 3D scores ----
+    do_hd95 = (not args.skip_hd95) and _SCIPY_OK
+    dsc_per_organ  = defaultdict(list)          # class -> one DSC per case
+    hd95_per_organ = defaultdict(list)
+    n_degenerate = 0
+
+    for cid in tqdm(sorted(case_slices), desc='Case-wise 3D metrics'):
+        items    = sorted(case_slices[cid], key=lambda it: it[0])
+        pred_vol = np.stack([it[1] for it in items], axis=0)     # (D, H, W)
+        gt_vol   = np.stack([it[2] for it in items], axis=0)
+        for c in range(1, num_classes):
+            pc, gc = (pred_vol == c), (gt_vol == c)
+            inter, p_sum, g_sum = float((pc & gc).sum()), float(pc.sum()), float(gc.sum())
+            # Both sides empty: the organ is correctly absent, DSC = 1
+            dsc_per_organ[c].append(1.0 if p_sum + g_sum == 0
+                                    else 2 * inter / (p_sum + g_sum + 1e-6))
+            if do_hd95:
+                if not pc.any() or not gc.any():
+                    n_degenerate += 1
+                hd95_per_organ[c].append(compute_hd95(pc, gc))
+    case_slices.clear()
+
+    organ_dsc  = {c: float(np.mean(v)) for c, v in dsc_per_organ.items()}
+    organ_hd95 = {c: float(np.mean(v)) for c, v in hd95_per_organ.items()}
+
+    return {
+        'dice': float(np.mean(list(organ_dsc.values()))) if organ_dsc else 0.0,
+        'hd95': float(np.mean(list(organ_hd95.values()))) if organ_hd95 else None,
+        'organ_dsc':  organ_dsc,
+        'organ_hd95': organ_hd95,
+        'organ_names': organ_names,
+        'n_cases': len(dsc_per_organ[1]) if dsc_per_organ else 0,
+        'n_hd95_degenerate': n_degenerate,
+        'slice_iou':  float(np.mean(slice_iou))  if slice_iou  else 0.0,
+        'slice_dice': float(np.mean(slice_dice)) if slice_dice else 0.0,
+        'slice_sen':  float(np.mean(slice_sen))  if slice_sen  else 0.0,
+        'slice_acc':  float(np.mean(slice_acc))  if slice_acc  else 0.0,
+        'n_images':   sample_idx,
+        'total_sec':  total_time,
+        'per_image_ms': total_time / max(sample_idx, 1) * 1000,
+    }
+
+
 # ----------------------------------------------
 # CLI
 # ----------------------------------------------
@@ -278,14 +450,18 @@ def parse_args():
     p = argparse.ArgumentParser(description='FASDiT inference')
     p.add_argument('--checkpoint',     type=str, required=True)
     p.add_argument('--dataset',        type=str, default='glas',
-                   choices=['glas', 'monuseg', 'ph2', 'imid', 'tnbc'])
+                   choices=['glas', 'monuseg', 'ph2', 'imid', 'tnbc', 'synapse'])
     p.add_argument('--model',          type=str, default=None,
                    choices=list(FASDiT_models.keys()),
                    help='Model variant (default: read from the checkpoint, else B/16)')
     p.add_argument('--image_size',     type=int, default=None,
-                   help='Input size (default: glas/ph2/imid=256, monuseg/tnbc=512)')
+                   help='Input size (default: glas/ph2/imid=256, monuseg/tnbc=512, '
+                        'synapse=224)')
     p.add_argument('--batch_size',     type=int, default=4)
     p.add_argument('--image_channels', type=int, default=3)
+    p.add_argument('--mask_channels',  type=int, default=None,
+                   help='Mask channels (default: read from the checkpoint, '
+                        'else 1 and synapse=9)')
     p.add_argument('--num_timesteps',  type=int, default=200)
     p.add_argument('--beta_schedule',  type=str, default='cosine',
                    choices=['linear', 'cosine'])
@@ -335,7 +511,11 @@ def main():
                            f"{cfg['model']}; the architectures do not match.")
     if args.image_size is None:
         args.image_size = cfg.get('image_size') or (
-            512 if args.dataset in ('monuseg', 'tnbc') else 256)
+            224 if args.dataset == 'synapse'
+            else 512 if args.dataset in ('monuseg', 'tnbc') else 256)
+    if args.mask_channels is None:
+        args.mask_channels = cfg.get('mask_channels') or get_num_classes(args.dataset)
+    multiclass = args.mask_channels > 1
 
     # Data
     print("Loading dataset...")
@@ -348,7 +528,7 @@ def main():
     print(f"Creating model {args.model} @ {args.image_size}x{args.image_size}...")
     model = FASDiT_models[args.model](
         input_size=args.image_size,
-        mask_channels=1,
+        mask_channels=args.mask_channels,
         image_channels=args.image_channels,
     ).to(device)
 
@@ -370,13 +550,17 @@ def main():
                                   schedule_type=args.beta_schedule)
 
     params = count_params(model)
-    gflops = estimate_gflops(model, args.image_size, 1, args.image_channels, device)
+    gflops = estimate_gflops(model, args.image_size, args.mask_channels,
+                             args.image_channels, device)
 
     print("Running inference...")
-    r = run_inference(model, diffusion, test_loader, device, args)
+    if multiclass:
+        r = run_inference_multiclass(model, diffusion, test_loader, device, args)
+    else:
+        r = run_inference(model, diffusion, test_loader, device, args)
 
     # ---- Report ----
-    lines = [
+    header = [
         f"Checkpoint: {args.checkpoint}",
         f"Dataset:    {args.dataset} ({r['n_images']} images @ {args.image_size})",
         f"Sampling:   DDIM T'={args.ddim_steps}, eta={args.eta}, K={args.K}"
@@ -384,19 +568,51 @@ def main():
         "",
         f"Params:    {params:.2f} M",
         f"GFLOPs:    {gflops:.2f}" if gflops is not None else "GFLOPs:    N/A",
-        f"mIoU:      {r['iou']:.4f}",
-        f"DSC:       {r['dice']:.4f}",
-        f"Sen:       {r['rec']:.4f}",
-        f"Acc:       {r['acc']:.4f}",
-        f"Precision: {r['prec']:.4f}",
-        (f"HD95:      {r['hd95']:.2f} px" if r['hd95'] is not None
-         else "HD95:      N/A (needs scipy, or disabled with --skip_hd95)"),
-        (f"GED:       {r['ged']:.4f}" if r['ged'] is not None
-         else "GED:       N/A (needs --K > 1)"),
-        f"ECE:       {r['ece']:.4f}",
-        "",
-        f"Total time: {r['total_sec']:.2f} s  ({r['per_image_ms']:.1f} ms/image)",
     ]
+
+    if multiclass:
+        names = r['organ_names']
+        lines = header + [
+            f"Cases:     {r['n_cases']} volumes, scored at the native label resolution",
+            "",
+            "Case-wise 3D (the numbers reported in the paper):",
+            f"  DSC:     {r['dice'] * 100:.2f} %",
+            (f"  HD95:    {r['hd95']:.2f} voxels "
+             f"({r['n_hd95_degenerate']} of {r['n_cases'] * (args.mask_channels - 1)} "
+             f"(case, organ) pairs degenerate, counted as 0)"
+             if r['hd95'] is not None
+             else "  HD95:    N/A (needs scipy, or disabled with --skip_hd95)"),
+            "",
+            "  Per organ (DSC % / HD95 voxels):",
+        ] + [
+            f"    {names[c]:<6} {r['organ_dsc'][c] * 100:6.2f}" +
+            (f" / {r['organ_hd95'][c]:7.2f}" if c in r['organ_hd95'] else "")
+            for c in sorted(r['organ_dsc'])
+        ] + [
+            "",
+            "Slice level, macro over the foreground classes:",
+            f"  mIoU:    {r['slice_iou']:.4f}",
+            f"  DSC:     {r['slice_dice']:.4f}",
+            f"  Sen:     {r['slice_sen']:.4f}",
+            f"  Acc:     {r['slice_acc']:.4f}",
+            "",
+            f"Total time: {r['total_sec']:.2f} s  ({r['per_image_ms']:.1f} ms/slice)",
+        ]
+    else:
+        lines = header + [
+            f"mIoU:      {r['iou']:.4f}",
+            f"DSC:       {r['dice']:.4f}",
+            f"Sen:       {r['rec']:.4f}",
+            f"Acc:       {r['acc']:.4f}",
+            f"Precision: {r['prec']:.4f}",
+            (f"HD95:      {r['hd95']:.2f} px" if r['hd95'] is not None
+             else "HD95:      N/A (needs scipy, or disabled with --skip_hd95)"),
+            (f"GED:       {r['ged']:.4f}" if r['ged'] is not None
+             else "GED:       N/A (needs --K > 1)"),
+            f"ECE:       {r['ece']:.4f}",
+            "",
+            f"Total time: {r['total_sec']:.2f} s  ({r['per_image_ms']:.1f} ms/image)",
+        ]
     print("\n" + "=" * 50)
     print("\n".join(lines))
     print("=" * 50)
