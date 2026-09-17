@@ -1,14 +1,14 @@
 # --------------------------------------------------------
-# StruFreqDiT: A Diffusion Transformer for Medical Image Segmentation.
+# FASDiT: A Diffusion Transformer for Medical Image Segmentation.
 #
 # The diffusion process runs in the segmentation-mask space; the network is the
 # denoiser that predicts the clean mask x0 from a noisy mask x_t conditioned on
 # the medical image.
 #
-#   SSE encoder (image / noisy mask, dual stream, multi-scale)
+#   MS-DSE encoder (image / noisy mask, dual stream, multi-scale)
 #     -> DiT backbone over mask tokens (self-attention + 2D RoPE + adaLN-Zero)
 #     -> DFCA + PBDF frequency-decoupled condition injection after every block
-#     -> SSE decoder (symmetric U-shaped, dual-stream skips) -> x0_hat
+#     -> MS-DSE decoder (symmetric U-shaped, dual-stream skips) -> x0_hat
 #
 # The image condition reaches the mask stream through DFCA only: the
 # conditioning vector c carries the timestep, and image tokens never enter the
@@ -119,7 +119,7 @@ class SwiGLUFFN(nn.Module):
 
 
 # ============================================================
-# SSE encoding path: one multi-scale CNN branch
+# MS-DSE encoding path: one multi-scale CNN branch
 # (Spatial Structure Enhancement, Sec. III-C of the paper)
 # ============================================================
 
@@ -141,7 +141,7 @@ class ConvBlock(nn.Module):
 
 
 class MultiScaleEncoder(nn.Module):
-    """One SSE encoding branch (E_img or E_msk).
+    """One MS-DSE encoding branch (E_img or E_msk).
 
     Cascaded Conv-GroupNorm-GELU blocks with downsampling produce a feature
     pyramid {f1, f2, f3} used as decoder skips, and the last stage is pooled and
@@ -183,7 +183,7 @@ class MultiScaleEncoder(nn.Module):
 
 
 # ============================================================
-# SSE decoding path: symmetric multi-scale decoder
+# MS-DSE decoding path: symmetric multi-scale decoder
 # ============================================================
 
 class UpBlock(nn.Module):
@@ -240,7 +240,7 @@ class TimeModulatedSkip(nn.Module):
 
 
 class UNetDecoder(nn.Module):
-    """Symmetric U-shaped decoder of SSE.
+    """Symmetric U-shaped decoder of MS-DSE.
 
     The backbone tokens are adaLN-modulated by the timestep, reshaped to a
     feature map and upsampled stage by stage; at every scale the image-stream
@@ -469,7 +469,7 @@ class DFCA(nn.Module):
         return self.proj(out)
 
 
-class StruFreqDiTBlock(nn.Module):
+class FASDiTBlock(nn.Module):
     """Transformer block with adaLN-Zero conditioning."""
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
@@ -491,7 +491,7 @@ class StruFreqDiTBlock(nn.Module):
         return x
 
 
-class StruFreqDiT_Segmentation(nn.Module):
+class FASDiT_Segmentation(nn.Module):
 
     def __init__(
         self,
@@ -554,7 +554,7 @@ class StruFreqDiT_Segmentation(nn.Module):
 
         # === Transformer blocks ===
         self.blocks = nn.ModuleList([
-            StruFreqDiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,
+            FASDiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,
                         attn_drop=attn_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0,
                         proj_drop=proj_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0)
             for i in range(depth)
@@ -669,47 +669,47 @@ class StruFreqDiT_Segmentation(nn.Module):
 # Model variants
 # ============================================
 
-def StruFreqDiT_S_16(**kwargs):
+def FASDiT_S_16(**kwargs):
     """Small variant, patch_size=16 (4 blocks)."""
-    return StruFreqDiT_Segmentation(depth=4, hidden_size=512, num_heads=8, patch_size=16, **kwargs)
+    return FASDiT_Segmentation(depth=4, hidden_size=512, num_heads=8, patch_size=16, **kwargs)
 
-def StruFreqDiT_S_32(**kwargs):
+def FASDiT_S_32(**kwargs):
     """Small variant, patch_size=32."""
-    return StruFreqDiT_Segmentation(depth=4, hidden_size=512, num_heads=8, patch_size=32, **kwargs)
+    return FASDiT_Segmentation(depth=4, hidden_size=512, num_heads=8, patch_size=32, **kwargs)
 
-def StruFreqDiT_B_16(**kwargs):
+def FASDiT_B_16(**kwargs):
     """Base variant, patch_size=16 (6 blocks, tuned for small datasets)."""
-    return StruFreqDiT_Segmentation(depth=6, hidden_size=768, num_heads=12, patch_size=16, **kwargs)
+    return FASDiT_Segmentation(depth=6, hidden_size=768, num_heads=12, patch_size=16, **kwargs)
 
-def StruFreqDiT_B_32(**kwargs):
+def FASDiT_B_32(**kwargs):
     """Base variant, patch_size=32 (6 blocks, tuned for small datasets)."""
-    return StruFreqDiT_Segmentation(depth=6, hidden_size=768, num_heads=12, patch_size=32, **kwargs)
+    return FASDiT_Segmentation(depth=6, hidden_size=768, num_heads=12, patch_size=32, **kwargs)
 
-def StruFreqDiT_L_16(**kwargs):
+def FASDiT_L_16(**kwargs):
     """Large variant, patch_size=16 (8 blocks)."""
-    return StruFreqDiT_Segmentation(depth=8, hidden_size=1024, num_heads=16, patch_size=16, **kwargs)
+    return FASDiT_Segmentation(depth=8, hidden_size=1024, num_heads=16, patch_size=16, **kwargs)
 
-def StruFreqDiT_L_32(**kwargs):
+def FASDiT_L_32(**kwargs):
     """Large variant, patch_size=32 (8 blocks)."""
-    return StruFreqDiT_Segmentation(depth=8, hidden_size=1024, num_heads=16, patch_size=32, **kwargs)
+    return FASDiT_Segmentation(depth=8, hidden_size=1024, num_heads=16, patch_size=32, **kwargs)
 
-def StruFreqDiT_H_16(**kwargs):
+def FASDiT_H_16(**kwargs):
     """Huge variant, patch_size=16 (12 blocks)."""
-    return StruFreqDiT_Segmentation(depth=12, hidden_size=1280, num_heads=16, patch_size=16, **kwargs)
+    return FASDiT_Segmentation(depth=12, hidden_size=1280, num_heads=16, patch_size=16, **kwargs)
 
-def StruFreqDiT_H_32(**kwargs):
+def FASDiT_H_32(**kwargs):
     """Huge variant, patch_size=32 (12 blocks)."""
-    return StruFreqDiT_Segmentation(depth=12, hidden_size=1280, num_heads=16, patch_size=32, **kwargs)
+    return FASDiT_Segmentation(depth=12, hidden_size=1280, num_heads=16, patch_size=32, **kwargs)
 
 
 # Model registry
-StruFreqDiT_models = {
-    'StruFreqDiT-S/16': StruFreqDiT_S_16,
-    'StruFreqDiT-S/32': StruFreqDiT_S_32,
-    'StruFreqDiT-B/16': StruFreqDiT_B_16,
-    'StruFreqDiT-B/32': StruFreqDiT_B_32,
-    'StruFreqDiT-L/16': StruFreqDiT_L_16,
-    'StruFreqDiT-L/32': StruFreqDiT_L_32,
-    'StruFreqDiT-H/16': StruFreqDiT_H_16,
-    'StruFreqDiT-H/32': StruFreqDiT_H_32,
+FASDiT_models = {
+    'FASDiT-S/16': FASDiT_S_16,
+    'FASDiT-S/32': FASDiT_S_32,
+    'FASDiT-B/16': FASDiT_B_16,
+    'FASDiT-B/32': FASDiT_B_32,
+    'FASDiT-L/16': FASDiT_L_16,
+    'FASDiT-L/32': FASDiT_L_32,
+    'FASDiT-H/16': FASDiT_H_16,
+    'FASDiT-H/32': FASDiT_H_32,
 }

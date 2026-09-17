@@ -1,4 +1,4 @@
-name: strufreq-dit
+name: fas-dit
 channels:
   - pytorch
   - nvidia

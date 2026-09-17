@@ -1,18 +1,18 @@
-# StruFreq-DiT
+# FAS-DiT
 
 This is the official implementation of the TMI paper under review:
-**StruFreq-DiT: A Structure-Aware Diffusion Transformer with Frequency-Adaptive
+**FAS-DiT: A Structure-Aware Diffusion Transformer with Frequency-Adaptive
 Conditioning for Medical Image Segmentation**.
 
-StruFreq-DiT casts segmentation as an image-conditioned denoising process in the
+FAS-DiT casts segmentation as an image-conditioned denoising process in the
 **segmentation-mask space**: a Diffusion Transformer backbone denoises a noisy
 mask conditioned on the medical image and predicts the clean mask $\hat{y}_0$
 directly at every timestep. Two designs adapt the plain Diffusion Transformer to
-medical segmentation: **SSE** (Spatial Structure Enhancement) and **DFCA**
+medical segmentation: **MS-DSE** (Spatial Structure Enhancement) and **DFCA**
 (Diffusion Frequency Cross-Attention) with a parametric band-decoupling filter
 **PBDF**.
 
-![StruFreq-DiT framework](assets/framework.png)
+![FAS-DiT framework](assets/framework.png)
 
 This repository contains the **training and inference code for the full model
 only**. The network is fixed: there are no module switches, and training and
@@ -23,10 +23,10 @@ inference always build the same architecture.
 ## Method
 
 At a denoising step `t`, the image `x` and the noisy mask `y_t` go through the
-two **SSE** encoding branches, which produce backbone tokens plus multi-scale
-skip features each. The mask tokens run through `L` StruFreq-DiT blocks of
+two **MS-DSE** encoding branches, which produce backbone tokens plus multi-scale
+skip features each. The mask tokens run through `L` FAS-DiT blocks of
 timestep-modulated self-attention, and **DFCA** injects the image condition
-after every block. The SSE decoder then upsamples the refined tokens, fusing the
+after every block. The MS-DSE decoder then upsamples the refined tokens, fusing the
 image-stream and mask-stream skips at each scale, and a `tanh` output layer
 gives the clean-mask estimate. The image condition reaches the mask stream
 through DFCA only, so image tokens never enter the backbone self-attention.
@@ -50,7 +50,7 @@ detail as `t` decreases.
 
 ```bash
 conda env create -f environment.yaml
-conda activate strufreq-dit
+conda activate fas-dit
 ```
 
 or, with an existing PyTorch installation:
@@ -81,7 +81,7 @@ evaluated on TNBC without fine-tuning), so it needs a `test/` split only.
 Put the prepared folders in the project root, one per dataset:
 
 ```
-StruFreq-DiT/
+FAS-DiT/
 ├── processed_glas/
 │   ├── train/
 │   │   ├── images/    img_001.png, img_002.png, ...
@@ -130,10 +130,10 @@ python train.py --dataset glas --resume checkpoints/<run>/checkpoint_epoch100.pt
 
 | Dataset | Input | Variant | Batch | LR |
 | --- | --- | --- | --- | --- |
-| GlaS | 256² | StruFreq-DiT-B/16 | 8 | 2e-4 |
-| PH2 | 256² | StruFreq-DiT-B/16 | 8 | 2e-4 |
-| IMID | 256² | StruFreq-DiT-B/16 | 4 | 2e-4 |
-| MoNuSeg | 512² | StruFreq-DiT-B/32 | 4 | 1e-4 |
+| GlaS | 256² | FAS-DiT-B/16 | 8 | 2e-4 |
+| PH2 | 256² | FAS-DiT-B/16 | 8 | 2e-4 |
+| IMID | 256² | FAS-DiT-B/16 | 4 | 2e-4 |
+| MoNuSeg | 512² | FAS-DiT-B/32 | 4 | 1e-4 |
 
 Common to all runs: `T = 200` diffusion steps, cosine noise schedule, direct
 $\hat{y}_0$ prediction, AdamW with weight decay 0.05, MSE + soft Dice loss
@@ -146,7 +146,7 @@ Checkpoints go to `checkpoints/<dataset>_<model>_<timestamp>/`, TensorBoard
 logs and loss curves to `logs/`. Evaluate `best_model.pth` (best EMA validation
 mIoU).
 
-Variants: `StruFreq-DiT-{S,B,L,H}/{16,32}`, i.e. depth 4 / 6 / 8 / 12 with hidden
+Variants: `FAS-DiT-{S,B,L,H}/{16,32}`, i.e. depth 4 / 6 / 8 / 12 with hidden
 size 512 / 768 / 1024 / 1280 and patch size 16 or 32. The paper uses `B`.
 
 ## Inference
@@ -179,7 +179,7 @@ python inference.py --checkpoint checkpoints/<monuseg-run>/best_model.pth \
 ## Repository layout
 
 ```
-model_strufreq_dit.py    model definition (SSE, DFCA/PBDF, DiT backbone) and variants
+model_fas_dit.py    model definition (MS-DSE, DFCA/PBDF, DiT backbone) and variants
 diffusion_utils.py    cosine schedule, DDIM sampling, MSE + Dice loss
 dataset.py            dataset loaders and dataloader factories
 train.py              training entry point

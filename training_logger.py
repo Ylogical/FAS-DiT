@@ -1,5 +1,5 @@
 """
-Training logger for StruFreqDiT: mirrors stdout to a log file, records train/eval losses and
+Training logger for FASDiT: mirrors stdout to a log file, records train/eval losses and
 IoU/Dice, and plots the curves. Resumes from an existing loss_history.json.
 """
 import os
